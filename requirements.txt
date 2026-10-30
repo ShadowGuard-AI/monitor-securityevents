@@ -1,6 +1,4 @@
-```
 psutil>=5.9.5
 win32evtlog>=3.0.0
 win32evtlogutil>=1.0.0
 win32security>=1.0.0
-```

@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # monitor-securityevents
 Monitors the Windows Security Event Log for specific events, allowing filtering by Event ID, source, and user. Uses the `winevt` library for efficient log access and filtering. - Focused on System monitoring and alerts
 

@@ -2,9 +2,7 @@ import argparse
 import logging
 import sys
 import time
-import xml.etree.ElementTree as ET
 
-import psutil
 import win32evtlog
 import win32evtlogutil
 import win32security
@@ -14,6 +12,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Define constants
 SECURITY_LOG = "Security"
+
+# Highest event record number seen so far, kept across passes so persist
+# mode yields only newer events instead of reprinting the whole log.
+_highest_record_seen = 0
 
 def setup_argparse():
     """
@@ -43,6 +45,10 @@ def get_security_event_log(event_id=None, source=None, user=None):
     Yields:
         tuple: A tuple containing the event time, event ID, event source, and event message.
     """
+    global _highest_record_seen
+    seen_before_this_pass = _highest_record_seen
+    pass_highest = seen_before_this_pass
+    hand = None
     try:
         # Open the Security Event Log
         hand = win32evtlog.OpenEventLog(None, SECURITY_LOG)  # Using None for local machine
@@ -57,33 +63,41 @@ def get_security_event_log(event_id=None, source=None, user=None):
         while events:
             for event in events:
                 try:
+                    record_number = getattr(event, "RecordNumber", None)
+                    if record_number is not None:
+                        if record_number <= seen_before_this_pass:
+                            continue
+                        pass_highest = max(pass_highest, record_number)
+
                     event_time = event.TimeGenerated.Format()
                     event_id_val = event.EventID & 0x3FFFFFFF # mask out top bits
                     event_source = event.SourceName
-                    
+
                     # Get user sid
                     user_sid = None
                     try:
-                        for str_val in event.StringInserts:
-                            if "S-" in str_val:
+                        for str_val in (event.StringInserts or []):
+                            if isinstance(str_val, str) and str_val.startswith("S-"):
                                 user_sid = str_val
                                 break
                     except Exception as e:
                         logging.warning(f"Error getting SID from event: {e}")
-                                
+
+                    # LookupAccountSid needs a SID object, so convert the
+                    # string first. With no SID in the event, skip the
+                    # lookup cleanly and leave the account as None.
                     user_account = None
-                    try:
-                        if user_sid:
-                            user_account = win32security.LookupAccountSid(None, user_sid)[0]
-                    except Exception as e:
-                        logging.warning(f"Error looking up user account: {e}")
+                    if user_sid:
+                        try:
+                            sid_object = win32security.ConvertStringSidToSid(user_sid)
+                            user_account = win32security.LookupAccountSid(None, sid_object)[0]
+                        except Exception as e:
+                            logging.warning(f"Error looking up user account: {e}")
 
+                    # SafeFormatMessage returns the formatted message text
+                    # itself; that string is the message.
+                    event_message = win32evtlogutil.SafeFormatMessage(event, SECURITY_LOG)
 
-                    # Convert to XML for easier parsing
-                    xml_string = win32evtlogutil.SafeFormatMessage(event, SECURITY_LOG)
-                    root = ET.fromstring(xml_string)
-                    event_message = root.find(".//{http://schemas.microsoft.com/win/2004/08/events/event}Data[@Name='SubjectUserName']").text
-                    
                     # Apply filters
                     if event_id is not None and event_id_val != event_id:
                         continue
@@ -92,12 +106,14 @@ def get_security_event_log(event_id=None, source=None, user=None):
                     if user is not None and user_account != user:
                         continue
 
-                    yield event_time, event_id_val, event_source, event_message
+                    yield event_time, event_id_val, event_source, event_message, user_account
 
                 except Exception as e:
                     logging.error(f"Error processing event: {e}")
-            
+
             events = win32evtlog.ReadEventLog(hand, flags, 0)
+
+        _highest_record_seen = pass_highest
 
     except Exception as e:
         logging.error(f"Error accessing event log: {e}")
@@ -117,13 +133,17 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("Debug mode enabled.")
-    
+
+    if args.interval <= 0:
+        logging.error("Interval must be a positive number of seconds.")
+        sys.exit(1)
+
     logging.info("Starting Security Event Log monitor...")
 
     try:
         while True:
-            for event_time, event_id, event_source, event_message in get_security_event_log(args.event_id, args.source, args.user):
-                print(f"Time: {event_time}, Event ID: {event_id}, Source: {event_source}, User: {event_message}")
+            for event_time, event_id, event_source, event_message, user_account in get_security_event_log(args.event_id, args.source, args.user):
+                print(f"Time: {event_time}, Event ID: {event_id}, Source: {event_source}, User: {user_account}, Message: {event_message}")
 
             if not args.persist:
                 break

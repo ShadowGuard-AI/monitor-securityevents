@@ -58,8 +58,22 @@ def get_security_event_log(event_id=None, source=None, user=None):
         flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
 
         # Read events from the log
+        # The first run is the extreme case of the pass above: with
+        # the watermark at zero, a one shot run is a dump of the
+        # entire Security log through the message formatter, which
+        # on a real machine is thousands of events and a long wait
+        # for a tool whose examples read like a quick check.
         events = win32evtlog.ReadEventLog(hand, flags, 0)
 
+        # Every pass walks the log backwards from the newest record
+        # to the oldest, the whole log, however large it has grown.
+        # The watermark trims what is printed, not what is read:
+        # each record is still opened, formatted, and its SID looked
+        # up before the filters discard it. On a busy machine the
+        # reader spends its life re-reading history to reach the few
+        # new records at the front, and a pass interrupted before it
+        # finishes never commits the watermark, so the next pass
+        # prints the same events again.
         while events:
             for event in events:
                 try:
@@ -77,6 +91,14 @@ def get_security_event_log(event_id=None, source=None, user=None):
                     user_sid = None
                     try:
                         for str_val in (event.StringInserts or []):
+                            # The user of an event is taken to be the first insert
+                            # string that looks like a SID. Event inserts are positional
+                            # and event specific: for the common logon events the first
+                            # SID shaped string belongs to the subject, the account that
+                            # performed or reported the action, not always the account
+                            # the event is about. Attribution here is a guess by shape,
+                            # and when it guesses, it guesses a real account name, so
+                            # the output looks certain either way.
                             if isinstance(str_val, str) and str_val.startswith("S-"):
                                 user_sid = str_val
                                 break
@@ -103,6 +125,12 @@ def get_security_event_log(event_id=None, source=None, user=None):
                         continue
                     if source is not None and event_source != source:
                         continue
+                    # The help text asks for the account as DOMAIN\username,
+                    # and this compares it against the bare account name: the
+                    # lookup's domain half is discarded one step earlier. A
+                    # filter written the way the help instructs can therefore
+                    # never match anything, and the monitor runs silently
+                    # yielding nothing, looking exactly like a quiet log.
                     if user is not None and user_account != user:
                         continue
 
